@@ -23,8 +23,7 @@ import sys, os
 import zipfile
 import struct
 import time
-import curses
-import curses.ascii
+import string
 from operator import attrgetter
 import volatility.plugins as plugins
 import volatility.debug as debug
@@ -296,15 +295,29 @@ class vnode(obj.CType):
         cur = memq.m("next").dereference_as("vm_page")
 
         file_size = self.v_un.vu_ubcinfo.ui_size
-        
         phys_as = utils.load_as(self.obj_vm.get_config(), astype = 'physical')
-        
+
+        idx = 0
+        written = 0
+
         while cur and cur.is_valid() and cur.offset < file_size:
-            if cur.offset > 0:
-                buf = phys_as.zread(cur.phys_page * 4096, 4096)              
+            # the last element of the queue seems to track the size of the queue
+            if cur.offset != 0 and cur.offset == idx:
+                break
+                
+            if cur.phys_page != 0 and cur.offset >= 0:
+                sz = 4096
+
+                if file_size - written < 4096:
+                    sz = file_size - written
+
+                buf = phys_as.zread(cur.phys_page * 4096, sz)
 
                 yield (cur.offset.v(), buf)
-     
+
+            idx     = idx + 1
+            written = written + 4096
+
             cur = cur.listq.next.dereference_as("vm_page")
 
 class fileglob(obj.CType):
@@ -383,6 +396,9 @@ class proc(obj.CType):
         if not proc_as:
             return
 
+        shared_start = self.task.shared_region.sr_base_address 
+        shared_end   = shared_start + self.task.shared_region.sr_size
+
         bit_string = str(self.task.map.pmap.pm_task_map or '')[9:]
         if bit_string.find("64BIT") == -1:
             addr_type       = "unsigned int"
@@ -439,8 +455,9 @@ class proc(obj.CType):
                                 bucket = bucket.next_bucket()
                                 continue
 
-                            if pdata.is_valid() and (0 <= pdata.flags <= 2):
-                                yield bucket
+                            if bucket.key != None and bucket.data != None and pdata.is_valid() and (0 <= pdata.flags <= 2):
+                                if len(str(bucket.key)) > 0 or len(str(bucket.data.path)) > 0:
+                                    yield bucket
 
                             bucket = bucket.next_bucket()
                 
@@ -645,7 +662,7 @@ class proc(obj.CType):
 
         test_string = str(test_string)
         for s in test_string:
-            if not curses.ascii.isprint(s):
+            if not s in string.printable:
                 valid = False
                 break
 
@@ -756,7 +773,7 @@ class proc(obj.CType):
 
     def netstat(self):
         for (filp, _, _) in self.lsof():
-            if filp.f_fglob.fg_type == 'DTYPE_SOCKET':
+            if filp.f_fglob.is_valid() and filp.f_fglob.fg_type == 'DTYPE_SOCKET':
                 socket = filp.f_fglob.fg_data.dereference_as("socket") 
                 family = socket.family
     
@@ -768,9 +785,12 @@ class proc(obj.CType):
                     proto = socket.protocol
                     state = socket.state
                    
-                    (lip, lport, rip, rport) = socket.get_connection_info()
- 
-                    yield (family, (socket, proto, lip, lport, rip, rport, state))
+                    vals = socket.get_connection_info()
+
+                    if vals:
+                        (lip, lport, rip, rport) =  vals
+     
+                        yield (family, (socket, proto, lip, lport, rip, rport, state))
 
     @property
     def p_gid(self):
@@ -1055,7 +1075,8 @@ class proc(obj.CType):
 
         for vma in self.get_proc_maps():
             if vma.get_perms() != "rw-" or vma.get_path() != "":
-                continue
+                if vma.get_special_path() != "[heap]":
+                    continue
 
             offset = vma.links.start
             out_of_range = vma.links.start + (vma.links.end - vma.links.start)
@@ -1130,7 +1151,7 @@ class proc(obj.CType):
 
         for i, fd in enumerate(fds):
             f = fd.dereference_as("fileproc")
-            if f:
+            if f and f.f_fglob.is_valid():
                 ftype = f.f_fglob.fg_type
                 if ftype == 'DTYPE_VNODE': 
                     vnode = f.f_fglob.fg_data.dereference_as("vnode")
@@ -1352,23 +1373,19 @@ class vm_map_entry(obj.CType):
 
     # used to find heap, stack, etc.
     def get_special_path(self):
-        # check the heap
-        ret = ""
-
-        # TODO - figure out how to track heap regions once el cap source code is released
         if hasattr(self, "alias"):
-            for i in [1, 2, 3, 4, 6, 7, 8, 9]:
-                if self.alias == i:
-                    ret = "[heap]"
-                    break
+            check = self.alias.v()
+        else:
+            check = self.vme_offset.v() & 0xfff
 
-        if ret != "":
-            return ret
-
-        if hasattr(self, "alias") and self.alias == 30:
+        if 0 < check < 10:
+            ret = "[heap]"
+        elif check == 30:
             ret = "[stack]"
+        else:
+            ret = ""
 
-        return ret 
+        return ret
 
     def get_path(self):
         vnode = self.get_vnode()
@@ -1417,6 +1434,26 @@ class vm_map_entry(obj.CType):
             ret = None
 
         return ret
+
+    def resident_count(self):
+        vmobj = self.object.object()
+
+        if not vmobj:
+            return 0
+
+        # based on OBJ_RESIDENT_COUNT
+        # all versions since OS X 10.6
+        if hasattr(vmobj, "all_reusable"):
+            if vmobj.all_reusable == 1:
+                count = vmobj.wired_page_count.v()
+            else:
+                count = vmobj.resident_page_count.v() - vmobj.reusable_page_count.v()
+
+        # really old systems - OS X 10.5 
+        else:
+           count = vmobj.resident_page_count.v()
+
+        return count
 
     def is_suspicious(self):
         ret = False        
@@ -1543,7 +1580,14 @@ class socket(obj.CType):
         inpcb = self.so_pcb.dereference_as("inpcb")
         tcpcb = inpcb.inp_ppcb.dereference_as("tcpcb")
 
-        return tcp_states[tcpcb.t_state]
+        state = tcpcb.t_state
+        
+        if state:
+            ret = tcp_states[tcpcb.t_state]
+        else:
+            ret = "<INVALID>"
+
+        return ret
 
     @property
     def state(self):
@@ -1555,6 +1599,9 @@ class socket(obj.CType):
         return ret
         
     def get_connection_info(self):
+        if not self.so_pcb.is_valid():
+            return None
+
         ipcb = self.so_pcb.dereference_as("inpcb")
         
         if self.family == 2:
@@ -2022,6 +2069,20 @@ for path in set(plugins.__path__):
         for fn in files:
             if zipfile.is_zipfile(os.path.join(path, fn)):
                 new_classes.append(MacProfileFactory(zipfile.ZipFile(os.path.join(path, fn))))
+
+kext_overlay = {
+    'kmod_info_class': [None, {
+        'name'  : [ None , ['String', dict(length = 64)]],
+        }],
+}
+
+class KextOverlay(obj.ProfileModification):
+    conditions = {'os': lambda x: x == 'mac'}
+    before = ['BasicObjectClasses']
+
+    def modification(self, profile):
+        if 'kmod_info_class' in profile.vtypes:
+            profile.merge_overlay(kext_overlay)
 
 class MacOverlay(obj.ProfileModification):
     conditions = {'os': lambda x: x == 'mac'}
